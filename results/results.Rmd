@@ -1,0 +1,1110 @@
+---
+title: 'Learning a typologically unusual reduplication pattern: An artificial language
+  learning study of base-dependent reduplication'
+author: "Adam Ussishkin, Jason Haugen, Colin Dawson, Andrew Wedel"
+date: ''
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, 
+  message = FALSE, 
+  warning = FALSE,
+  results = 'hide', 
+  error = FALSE,
+  cache = TRUE,
+  fig.path = "./figures/",
+  cache.path = "./cache/")
+## Time-consuming model fitting code is read in from cache if this is FALSE
+## Set to true to refit models
+refit_models = FALSE
+```
+
+```{r load_packages, cache = FALSE}
+library(lme4)
+# library(rstanarm)
+library(tidyverse)
+library(magrittr)
+library(tcltk)
+library(parallel)
+library(psych)
+library(emmeans)
+options(mc.cores = parallel::detectCores())
+```
+
+```{r read_data}
+file <- "../data/full-nofileheader.csv"
+
+## Read the raw file
+raw_data <- read_csv(file)
+```
+
+```{r clean_data}
+clean_data <- raw_data %>%
+  rename_with(gsub, pattern = "(.*)\\[(.*)\\]", replacement = "\\1\\.\\2") %>%
+  mutate(
+    Subject  = as_factor(Subject),
+    FakeWord = as_factor(FakeWord),
+    Prompt   = as_factor(Prompt),
+    Correct  = StimDisplay.ACC-1,
+    CV       = ifelse(Condition == "CV", 1, 0),
+    CVC      = ifelse(Condition == "CVC", 1, 0),
+    CVX      = ifelse(Condition == "CVX", 1, 0),
+    rTrial   = TrialList1.Sample,
+    has_kw   = FakeWord %in% c("wakota", "woknuta", "wokwisa")) %>%
+  select(
+    Subject,
+    Condition,
+    rTrial,
+    FakeWord,
+    Prompt,
+    CVCCRESP,
+    CVCRESP,
+    CVXCRESP,    
+    StimDisplay.CRESP,
+    StimDisplay.RESP,
+    StimDisplay.ACC,
+    Correct,
+    CV, CVC, CVX,
+    has_kw
+  )
+
+plural_only <- clean_data %>%
+  filter(Prompt == "Plural")
+big_only <- clean_data %>%
+  filter(Prompt == "Big")
+```
+
+```{r subject_info}
+## Create a table showing which subject is in which condition
+subject_condition_info <- clean_data %>%
+  group_by(Subject) %>%
+  summarize(Condition = first(Condition))
+
+## Create a table showing the first, last, and total number of trials 
+## each subject responded to for each Prompt type
+subject_prompt_info <- clean_data %>%
+  group_by(Subject, Prompt) %>%
+  summarize(
+    n_trials    = n(),
+    first_trial = min(rTrial),
+    last_trial  = max(rTrial))  
+```
+
+```{r overall_correct_by_subject}
+filter_cutoff <- 75
+
+correct_by_subject_prompt <- clean_data %>% 
+  filter(rTrial > filter_cutoff) %>%
+  group_by(Subject, Prompt) %>% 
+  summarize(
+    n_trials  = n(),
+    percentCorrect  = 100 * mean(StimDisplay.ACC)) %>%
+  left_join(subject_condition_info, by = "Subject") %>%
+  select(Subject, Condition, Prompt, n_trials, percentCorrect) %>%
+  pivot_wider(
+    names_from  = Prompt,
+    values_from = c(n_trials, percentCorrect)) %>%
+  mutate(
+    n_trials_Overall       = n_trials_Big + n_trials_Plural,
+    percentCorrect_Overall = 
+      (n_trials_Big * percentCorrect_Big + 
+         n_trials_Plural * percentCorrect_Plural) / 
+      n_trials_Overall) %>%
+  arrange(Condition, percentCorrect_Overall) %>%
+  rownames_to_column(var = "Rank")
+```
+
+```{r load_overall_logistic, eval = !refit_models}
+lazyLoad("model-cache/overall_logistic_models")
+```
+
+
+```{r overall_logistic_models, eval = refit_models}
+## Predicted Subject by Subject Accuracy at the end of the study in the Big Prompt
+# A single model with Subject as a fixed effect (equivalent to separate curves for each subject)
+plural_trial_model <- glm(StimDisplay.ACC ~ Subject * rTrial, family = binomial, data = plural_only)
+big_trial_model    <- glm(StimDisplay.ACC ~ Subject * rTrial, family = binomial, data = big_only)
+```
+
+```{r assemble_participant_metrics}
+last_plural_prediction_frame <- subject_prompt_info %>%
+  filter(Prompt == "Plural") %>%
+  rename(rTrial = last_trial) %>%
+  select(Subject, rTrial)
+last_big_prediction_frame <- subject_prompt_info %>%
+  filter(Prompt == "Big") %>%
+  rename(rTrial = last_trial) %>%
+  select(Subject, rTrial)
+
+correct_by_subject_prompt <- correct_by_subject_prompt %>%
+  bind_cols(
+    tibble(
+      predicted_plural_final = predict(
+        object  = plural_trial_model, 
+        newdata = last_plural_prediction_frame, 
+        type    = "response"),
+      predicted_big_final = predict(
+        object  = big_trial_model,
+        newdata = last_big_prediction_frame, 
+        type    = "response")
+      # predicted_big_final_kw = predict(
+      #   object  = big_trial_model_kw,
+      #   newdata = last_big_prediction_frame, 
+      #   type    = "response")      )
+      ))
+```
+
+```{r format_data_for_modeling}
+## Create factors and define contrast codes
+prompt_contrasts <- cbind(Plural = c("Big" = 0, "Plural" = 1))
+condition_contrasts <- cbind(
+  CVCvsCV   = c(CV = -1, CVC =  1, CVX = 0), 
+  CVXvsRest = c(CV = -1, CVC = -1, CVX = 2))
+
+trial_transformations <-
+  clean_data %>%
+  select(rTrial) %>%
+  distinct() %>%
+  mutate(
+    cTrial    = (rTrial - 75.5),
+    sTrial    = rTrial / 25,
+    csTrial   = cTrial / 25)
+
+model_ready_data <- clean_data %>% 
+  mutate(
+    Condition = factor(Condition, levels = c("CV", "CVC", "CVX")),
+    Prompt    = factor(Prompt,    levels = c("Big", "Plural")),
+    Subject   = factor(Subject),
+    FakeWord  = factor(FakeWord)) %>%
+  mutate(
+    Prompt    = Prompt    %>% C(contr = prompt_contrasts),
+    Condition = Condition %>% C(contr = condition_contrasts),
+    CVCvsCV   = case_when(
+      Condition == "CV"  ~ condition_contrasts["CV",  "CVCvsCV"],
+      Condition == "CVC" ~ condition_contrasts["CVC", "CVCvsCV"],
+      Condition == "CVX" ~ condition_contrasts["CVX", "CVCvsCV"]),
+    CVXvsRest = case_when(
+      Condition == "CV"  ~ condition_contrasts["CV",  "CVXvsRest"],
+      Condition == "CVC" ~ condition_contrasts["CVC", "CVXvsRest"],
+      Condition == "CVX" ~ condition_contrasts["CVX", "CVXvsRest"]),
+    Plural    = case_when(
+      Prompt == "Big"    ~ prompt_contrasts["Big", "Plural"],
+      Prompt == "Plural" ~ prompt_contrasts["Plural", "Plural"])) %>%
+  left_join(trial_transformations, by = "rTrial") %>%
+  mutate(PluralXcsTrial = Plural * csTrial)
+```
+
+```{r group_level_data}
+item_data <- model_ready_data %>%
+  group_by(FakeWord, Prompt, Condition) %>%
+  summarize(
+    n_trials     = n(),
+    prop_correct = mean(StimDisplay.ACC)) %>%
+  pivot_wider(
+    names_from  = Condition, 
+    values_from = c(n_trials, prop_correct)) %>%
+  mutate(
+    CVCvsCV   = prop_correct_CVC - prop_correct_CV,
+    CVXvsRest = prop_correct_CVX - (prop_correct_CVC + prop_correct_CV)/2,
+    has_kw    = FakeWord %in% c("wakota", "woknuta", "wokwisa"))
+
+kw_comparison <- 
+  item_data %>%
+    group_by(Prompt, has_kw) %>%
+    summarize(across(starts_with("prop_correct"), mean)) %>%
+  pivot_longer(
+    cols         = starts_with("prop_correct"), 
+    names_prefix = "prop_correct_", 
+    names_to     = "Condition", 
+    values_to    = "prop_correct") %>%
+  ggplot(aes(x = Condition, fill = has_kw, y = prop_correct)) +
+    facet_wrap(~Prompt) +
+    geom_bar(stat = "identity", position = "dodge")
+
+subject_data <- model_ready_data %>%
+  group_by(Condition, Subject, Prompt) %>%
+  summarize(
+    n_trials    = n(),
+    prop_correct = mean(StimDisplay.ACC)) %>%
+  pivot_wider(
+    names_from  = Prompt, 
+    values_from = c(n_trials, prop_correct)) %>%
+  mutate(
+    n_trials_Overall     = n_trials_Big + n_trials_Plural,
+    prop_correct_Overall = 
+      (n_trials_Big * prop_correct_Big + n_trials_Plural * prop_correct_Plural) / 
+      n_trials_Overall,
+    plural_vs_big        = prop_correct_Plural - prop_correct_Big)
+```
+
+```{r filter_glmer_data}
+glmer_data <- model_ready_data %>% 
+  left_join(
+    subject_data %>% select(
+      Subject, 
+      prop_correct_Overall),
+    by = c("Subject", "Condition")) %>%
+  filter(prop_correct_Overall > 0) # No correct responses
+```
+
+```{r read_full_model_from_cache, eval = !refit_models}
+load("model-cache/full_model.RData")
+```
+
+```{r fit_full_model, eval = refit_models}
+## This is set to be skipped because it takes a long time to run, so the results
+## are read from a precomputed cache in the preceding chunk.
+## To recompute, set eval=FALSE for the load() chunk above, and set eval=TRUE here
+full_model <- 
+  glmer(
+     formula = StimDisplay.ACC ~ Prompt * Condition + csTrial + Prompt:csTrial + 
+       csTrial:Condition + Prompt:csTrial:Condition + 
+       (Prompt * csTrial | Subject) + (Condition | FakeWord),
+     data = glmer_data,
+     family  = "binomial",
+     control = glmerControl(optimizer = "bobyqa", 
+                            optCtrl=list(maxfun=2e4)))
+```
+
+```{r load_no_big_interaction_model, eval = !refit_models}
+lazyLoad("model-cache/no_big_interaction")
+```
+
+```{r fit_no_big_interaction, eval = refit_models}
+## Same here: exchange
+glmer_no_big_interaction <- #full_model
+  glmer(
+    StimDisplay.ACC ~ Prompt * Condition + csTrial +
+      Plural:csTrial + Plural:csTrial:Condition +
+      (Prompt * csTrial | Subject) + (Condition | FakeWord),
+     data = glmer_data,
+     family = "binomial",
+     control = glmerControl(optimizer = "bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+```
+
+```{r anova_big_interaction}
+anova_big_interaction <- anova(full_model, glmer_no_big_interaction)
+```
+
+```{r load_no_plural_interaction, eval = !refit_models}
+lazyLoad("model-cache/no_plural_interaction")
+```
+
+```{r no_plural_interaction, eval = refit_models}
+glmer_no_plural_interaction <-
+  glmer(
+    StimDisplay.ACC ~ Plural + I(1-Plural):Condition + csTrial + 
+      I(1-Plural):csTrial + I(1-Plural):csTrial:Condition + 
+      (Prompt * csTrial | Subject) + (Condition | FakeWord),
+     data = glmer_data,
+     family = "binomial",
+     control = glmerControl(optimizer = "bobyqa", 
+                            optCtrl=list(maxfun=2e3)))
+```
+
+```{r anova_plural_interaction}
+anova_plural_interaction <- anova(full_model, glmer_no_plural_interaction)
+```
+
+```{r load_aggregated_logistic_model, eval = !refit_models}
+lazyLoad("model-cache/aggregated_logistic")
+```
+
+```{r aggregated_logistic, eval = refit_models}
+overall_glm_plural <-
+  subject_data %>%
+  filter(prop_correct_Overall > 0) %>%
+  glm(
+    formula = prop_correct_Plural ~ Condition, 
+    family  = quasibinomial(link = "logit"), 
+    data    = ., 
+    weights = n_trials_Plural)
+overall_glm_big <-
+  subject_data %>%
+  filter(prop_correct_Overall > 0) %>%  
+  glm(
+    formula = prop_correct_Big ~ Condition, 
+    family  = quasibinomial(link = "logit"), 
+    data    = ., 
+    weights = n_trials_Big)
+save(overall_glm_plural, overall_glm_big, file = "aggregated_logistic.RData")
+```
+
+```{r, LRTs_by_prompt}
+LRT_Plural  <- anova(overall_glm_plural, test = "LRT")
+LRT_Big     <- anova(overall_glm_big, test = "LRT")
+t_tests_Big <- overall_glm_big %>% summary() %>% coefficients()
+```
+
+```{r overall_pct}
+helmert.emmc <- function(levs, ...) {
+    M <- as.data.frame(contr.helmert(levs))
+    names(M) <- paste(levs[-1],"vs earlier")
+    attr(M, "desc") <- "Helmert contrasts"
+    M
+}
+
+overall_condition_frame <- tibble(
+  Condition = c("CV", "CVC", "CVX"))
+
+empirical_correct_by_condition <-
+  glmer_data %>%
+  filter(Subject != 22) %>%
+  group_by(Subject, Condition, Prompt) %>%
+  summarize(
+    percent_correct = mean(StimDisplay.ACC)) %>%
+  group_by(Condition, Prompt) %>%
+  summarize(
+    n_subjects           = n(),
+    mean_percent_correct = mean(percent_correct),
+    sd_percent_correct   = sqrt(mean_percent_correct * (1 - mean_percent_correct) / n_subjects),
+    lower_quartile       = mean_percent_correct - 1.96 * sd_percent_correct,
+    upper_quartile       = mean_percent_correct + 1.96 * sd_percent_correct)
+
+
+estimated_correct_by_condition <-
+  full_model %>%
+  emmeans(
+    specs = ~ Condition*Prompt | csTrial, 
+    var   = "csTrial",
+    at    = list(csTrial = seq(-2.98,2.98,0.04)),
+    type  = "response")
+
+predicted_correct_by_condition <- 
+  estimated_correct_by_condition %>%
+  as_tibble() %>%
+  group_by(Condition, Prompt) %>%
+  summarize(
+    prob_correct = mean(prob),
+    ci_lwr       = mean(asymp.LCL),
+    ci_upr       = mean(asymp.UCL))
+# %>%
+#   left_join(
+#     emmeans(full_model, ~Condition*Prompt, type = "response") %>% as_tibble()) %>%
+#   rename(
+#     ci_lwr       = asymp.LCL,
+#     ci_upr       = asymp.UCL)
+```
+
+
+```{r group_means_plot}
+group_means_plot <- predicted_correct_by_condition %>%
+  ggplot(aes(x = Prompt, group = Condition, fill = Condition)) +
+  geom_bar(
+    data     = empirical_correct_by_condition, 
+    mapping  = aes(y = mean_percent_correct), 
+    stat     = "identity", 
+    position = position_dodge(),
+    alpha    = 0.3) +
+  geom_point(
+    aes(y = prob_correct, color = Condition), 
+    position = position_dodge(0.9), width = 0.1) +  
+  geom_errorbar(
+    aes(y = prob_correct, ymin = ci_lwr, ymax = ci_upr, color = Condition), 
+    position = position_dodge(0.9), width = 0.1) +
+  scale_y_continuous(
+    name = "Estimated Probability Correct (%)",
+    breaks = seq(0,1,0.1),
+    labels = seq(0,100,10),
+    limits = c(0,1))
+```
+
+```{r correct_by_subject_group_plot, cache = FALSE}
+correct_by_subject_group_plot <- correct_by_subject_prompt %>% 
+  filter(percentCorrect_Overall > 0) %>%
+  select(-n_trials_Big, -n_trials_Plural) %>%
+  mutate(Rank = parse_number(Rank)) %>%
+  pivot_longer(
+    cols      = c(percentCorrect_Plural, percentCorrect_Big),
+    names_to  = "Prompt", 
+    values_to = "percent_correct",
+    names_prefix = "percentCorrect_") %>%
+  ggplot(
+    aes(
+      x     = percent_correct, 
+      y     = Rank, 
+      group = Rank, 
+      color = Condition),
+    size = 3) +
+  geom_point(aes(shape = Prompt)) + 
+  geom_line() +
+  geom_vline(xintercept = 100/3, lty = 3) +
+  scale_shape_manual(values = c(1,15,2)) +
+  scale_y_continuous(name = "Participant", breaks = NULL) +
+  scale_x_continuous(
+    name = "Percent Correct in Second Half",
+    breaks = seq(0,100,10))
+```
+
+```{r block_data, cache = FALSE}
+percent_correct_by_block_data <- model_ready_data %>%
+  left_join(
+    select(subject_data, Subject, prop_correct_Overall), 
+    by = c("Subject", "Condition")) %>%
+  filter(prop_correct_Overall > 0) %>%
+  mutate(
+    Segment = cut(rTrial, breaks = seq(0, 150, 30))) %>%
+  group_by(Subject, Condition, Segment, Prompt) %>%
+  summarize(
+    percent_correct = 100*mean(StimDisplay.ACC))
+```
+
+```{r correct_by_block_plot, cache = FALSE}
+correct_by_block_plot <-
+  percent_correct_by_block_data %>%
+  left_join(
+    percent_correct_by_block_data %>% 
+      group_by(Condition, Segment, Prompt) %>%
+      summarize(
+        n_subjects           = n(),
+        mean_percent_correct = mean(percent_correct),
+        se_percent_correct   = 
+          100*sqrt(mean_percent_correct/100 * (1 - mean_percent_correct/100) / (n_subjects * 30)),
+        upper_quartile       = mean_percent_correct + 1.96 * se_percent_correct,
+        lower_quartile       = mean_percent_correct - 1.96 * se_percent_correct),
+    by = c("Condition", "Segment", "Prompt")) %>%
+  ggplot(aes(
+    x     = Segment, 
+    y     = mean_percent_correct, 
+    color = Condition, 
+    group = Condition)) +
+  geom_point() +
+  geom_line() +
+  geom_ribbon(
+    aes(
+      ymin = lower_quartile,
+      ymax = upper_quartile,
+      fill = Condition),
+      color = NA,
+    alpha = 0.1) +
+  geom_jitter(
+    aes(y = percent_correct, group = Subject), 
+    width  = 0.2,
+    height = 0,
+    alpha  = 0.25) +
+  facet_wrap(~Prompt) +
+  scale_x_discrete(
+    name = "Trial Block",
+    labels = c("0-30","30-60","60-90","90-120","120-150")) +
+  scale_y_continuous(
+    name = "Percent Correct",
+    limits = c(0,100),
+    breaks = seq(0,100,by=10))
+```
+
+```{r model_list}
+formulas <- list(
+  full_model = StimDisplay.ACC ~ 
+    csTrial * Prompt * Condition +
+    (Prompt * csTrial | Subject) + (Condition | FakeWord),
+  threeway_cvx_vs_rest_only = StimDisplay.ACC ~ 
+    (csTrial + Prompt + Condition)^2 + csTrial:Prompt:CVXvsRest + 
+    (Prompt * csTrial | Subject) + (Condition | FakeWord),  
+  threeway_cvc_vs_cv_only = StimDisplay.ACC ~ 
+    (csTrial + Prompt + Condition)^2 + csTrial:Prompt:CVCvsCV + 
+    (Prompt * csTrial | Subject) + (Condition | FakeWord),    
+  no_threeway = StimDisplay.ACC ~ 
+    (csTrial + Prompt + Condition)^2 +
+    (Prompt * csTrial | Subject) + (Condition | FakeWord),  
+  no_cv_vs_cvc = StimDisplay.ACC ~ 
+    csTrial * Prompt * CVXvsRest +
+    (Prompt * csTrial | Subject) + (Condition | FakeWord),
+  no_cvx_vs_rest = StimDisplay.ACC ~ 
+    csTrial * Prompt * CVCvsCV +
+    (Prompt * csTrial | Subject) + (Condition | FakeWord),  
+  no_condition = StimDisplay.ACC ~ 
+    csTrial * Prompt +
+    (Prompt * csTrial | Subject) + (Condition | FakeWord),
+  twoway_cvx_vs_rest_only = StimDisplay.ACC ~ 
+    csTrial + Prompt + Condition + (csTrial + Prompt + CVXvsRest)^2 +
+    (Prompt * csTrial | Subject) + (Condition | FakeWord),
+  twoway_cvc_vs_cv_only = StimDisplay.ACC ~ 
+    csTrial + Prompt + Condition + (csTrial + Prompt + CVCvsCV)^2 +
+    (Prompt * csTrial | Subject) + (Condition | FakeWord),  
+  cvc_vs_cv_main_only = StimDisplay.ACC ~ 
+    csTrial + Prompt + Condition + (csTrial + Prompt + CVXvsRest)^3 +
+   (Prompt * csTrial | Subject) + (Condition | FakeWord),
+  cvx_vs_rest_main_only = StimDisplay.ACC ~ 
+    csTrial + Prompt + Condition + (csTrial + Prompt + CVCvsCV)^3 +
+   (Prompt * csTrial | Subject) + (Condition | FakeWord),  
+  no_condition_by_prompt = StimDisplay.ACC ~ 
+   csTrial * (Prompt + Condition) +
+   (Prompt * csTrial | Subject) + (Condition | FakeWord),
+  cvx_vs_rest_only_twoway = StimDisplay.ACC ~ 
+   (csTrial + Prompt + CVXvsRest)^2 +
+   (Prompt * csTrial | Subject) + (Condition | FakeWord),
+  cvc_vs_cv_only_twoway = StimDisplay.ACC ~ 
+   (csTrial + Prompt + CVCvsCV)^2 +
+   (Prompt * csTrial | Subject) + (Condition | FakeWord)
+)
+```
+
+```{r load_glmer_models, eval = !refit_models}
+lazyLoad("model-cache/glmer-models")
+```
+
+```{r run_glmer_models, warning = TRUE, error = TRUE, message = TRUE, eval = refit_models}
+glmer_results <-
+  mclapply(
+    formulas, 
+    glmer,
+    mc.cores = getOption("mc.cores"),
+    mc.preschedule = FALSE,
+    data = glmer_data,
+    family = "binomial",
+    control = glmerControl(optimizer = "bobyqa", optCtrl=list(maxfun=2e5))
+  )
+```
+
+```{r bootstrap_fixed_setup}
+fixed_frame <- 
+  glmer_data %>%
+  select(Condition, Prompt, csTrial) %>%
+  lapply(unique) %>%
+  expand.grid()
+
+predfun <- function(.)
+{
+  predict(., re.form = ~0, type = "response")
+}
+
+fixed_predfun <- function(.)
+{
+  predict(., re.form = ~0, newdata = fixed_frame, type = "response")
+}
+```
+
+```{r subject_frame_setup}
+subjectIDs <- subject_data %>% pull(Subject)
+
+subject_frame <- 
+  glmer_data %>% 
+  select(Subject, Prompt, rTrial) %>%
+  lapply(unique) %>%
+  expand.grid() %>%
+  left_join(subject_condition_info, by = "Subject") %>%
+  left_join(trial_transformations, by = "rTrial") %>%
+  left_join(
+    model_ready_data %>% 
+      select(Prompt, Plural, rTrial, PluralXcsTrial) %>%
+      distinct(),
+    by = c("Prompt", "rTrial"))
+
+subject_random_model_matrix <- 
+  subject_frame %>%
+  mutate(Intercept = 1) %>%
+  select(Intercept, Plural, csTrial, PluralXcsTrial)
+
+subjects_in_order <-
+  subject_frame %>%
+  pull(Subject)
+
+random_matrix <-
+  full_model %>%
+  ranef() %>%
+  use_series(Subject) %>%
+  extract(subjects_in_order,)
+
+fixed_predictions <-
+  full_model %>%
+  predict(re.form = ~0, newdata = subject_frame, type = "link")
+
+subject_predictions <-
+  subject_random_model_matrix %>%
+  multiply_by(random_matrix) %>%
+  apply(MARGIN = 1, FUN = sum) %>%
+  add(fixed_predictions) %>%
+  logistic()
+```
+
+```{r load_bootstrap_results, eval = !refit_models}
+lazyLoad("model-cache/bootstrap-results")
+```
+
+```{r bootstrap_fixed_predictions, eval = refit_models}
+bootpredsBig <- 
+  bootMer(
+    glmer_results$full_model,
+    FUN      = fixed_predfun,
+    nsim     = 3200, 
+    use.u    = FALSE, 
+    type     = "parametric",
+    parallel = "multicore", 
+    ncpus    = getOption("mc.cores"))
+```
+
+```{r gather_bootstrap_results, cache = FALSE}
+fixed_bootstrap_results <- fixed_frame %>%
+  mutate(
+    fixed_estimate = fixed_predfun(glmer_results$full_model),
+    ci_95_upr = apply(bootpredsBig$t, MARGIN = 2, FUN = quantile, prob = c(0.975)),
+    ci_95_lwr = apply(bootpredsBig$t, MARGIN = 2, FUN = quantile, prob = c(0.025)))
+```
+
+```{r nested_tests, results = 'markup', cache = FALSE}
+anovas <- 
+  with(glmer_results, list(
+    overall                   = anova(full_model,                no_condition),
+    threeway_cv_vs_cvc        = anova(full_model,                threeway_cvx_vs_rest_only),
+    threeway_cvx_vs_rest      = anova(threeway_cvx_vs_rest_only, no_threeway),
+    cv_vs_cvc                 = anova(full_model,                no_cv_vs_cvc),
+    cvx_vs_rest               = anova(no_cv_vs_cvc,              no_condition),
+    threeway                  = anova(full_model,                no_threeway),
+    condition_by_prompt       = anova(full_model,                no_condition_by_prompt),
+    twoway_condition_by_prompt= anova(no_threeway,               no_condition_by_prompt),
+    twoway_cvx_vs_rest        = anova(no_cv_vs_cvc_no_threeway,  no_cv_vs_cvc_no_twoway),
+    twoway_cvx_vs_rest_twoway = anova(no_cv_vs_cvc_no_twoway,    no_cv_vs_cvc_no_threeway)))
+```
+
+```{r subject_glmer_curves, cache = FALSE}
+subject_curve_frame <-
+  subject_frame %>%
+    mutate(
+      subject_predictions = subject_predictions) %>%
+    left_join(
+      fixed_bootstrap_results,
+      by = c(
+        "csTrial"   = "csTrial",
+        "Condition" = "Condition", 
+        "Prompt"    = "Prompt"))
+```
+
+```{r prediction_plot, cache = FALSE}
+estimates_by_trial <- 
+  full_model %>%
+  emmeans(
+    specs = ~Condition*Prompt*csTrial, 
+    var   = "csTrial", 
+    at    = list(csTrial = seq(-2.98, 2.98, by = 0.04)))
+predicted_correct_by_trial <- 
+  estimates_by_trial %>%
+  as_tibble() %>%
+  rename(
+    prob_correct = emmean,
+    ci_lwr       = asymp.LCL,
+    ci_upr       = asymp.UCL) %>%
+  mutate(across(c(prob_correct, ci_lwr, ci_upr), logistic))
+predicted_correct_by_trial
+prediction_plot <- 
+  predicted_correct_by_trial %>%
+  ggplot(aes(x = csTrial, color = Condition, fill = Condition)) + 
+  facet_wrap(~Prompt) +
+  geom_ribbon(
+    aes(ymin = ci_lwr, ymax = ci_upr), alpha = 0.3, color = NA) +
+  geom_line(
+    aes(y = prob_correct), 
+    lwd = 1) +
+  # geom_line(
+  #   data    = subject_curve_frame,
+  #   mapping = aes(
+  #     y     = subject_predictions,
+  #     group = Subject),
+  #   alpha = 0.2,
+  #   lwd   = 0.3) +
+  scale_x_continuous(
+    name   = "Trial", 
+    breaks = seq(-3.02,2.98, by = 1.2),
+    labels = seq(0,150, by = 30),
+    limits = c(-3.02, 2.98)) + 
+  scale_y_continuous(
+    name = "% Correct", 
+    breaks = seq(0,1,0.1),
+    labels = seq(0,100,10))
+```
+
+```{r create_subject_plot, fig.width = 12, fig.height = 15}
+subject_plot <- subject_curve_frame %>%
+  left_join(
+    glmer_data %>% 
+      select(Subject,rTrial,StimDisplay.ACC),
+    by = c("Subject","rTrial")) %>%
+  mutate(
+    Subject = factor(
+      Subject, 
+      levels = subject_condition_info %>% 
+        arrange(Condition, Subject) %>%
+        pull(Subject))) %>%
+  ggplot(
+    aes(
+      x   = rTrial, 
+      col = Condition)) + 
+  geom_line(
+    aes(
+      y   = subject_predictions,
+      lty = Prompt)) +
+  geom_point(
+    aes(
+      y     = StimDisplay.ACC, 
+      shape = Prompt), 
+    size = 1, 
+    alpha = 0.3) +
+  facet_wrap(~Subject, nrow = 12, ncol = 9, dir = "v") + 
+  scale_x_continuous(name = "Trial", breaks = seq(0,150, by = 50)) + 
+  scale_y_continuous(name = "P(Correct)", breaks = NULL)
+```
+
+#### Abstract
+
+We report on an artificial language learning experiment testing the learnability of a typologically rare pattern of reduplication. Our model comes from syllable-copy reduplication in Hiaki (aka Yaqui, Uto-Aztecan), a base-dependent pattern wherein the shape of reduplication depends crucially on syllabification in the base: coda consonants can copy in reduplication if and only if there is a corresponding coda in the base. Using a controlled artificial language experiment with a forced-choice paradigm, we show that native English speakers who have no prior exposure to any language with a grammar employing syllable-copy reduplication are in many cases able to learn a variable CV or CVC syllable-copying rule as measured by eventual above-chance selection of the correct form. However, compared to participants learning either a consistent CV or CVC copying rule, the performance of participants tasked with learning such a variable syllable-copying rule improves more slowly, and these participants make more errors overall. We suggest that this difference in learnability may be one of a number of factors helping to explain the typological rarity of certain morphological patterns.
+
+## Introduction
+
+Typological asymmetries raise a variety of questions regarding cross-linguistic tendencies and can point to the relative likelihood of a particular type of pattern coming into existence or persisting over time within a language. Following a currently fruitful approach involving the application of experimental techniques to study such typological asymmetries, here we investigate whether learners in an artificial language learning experiment are able to extract generalizations within a well-controlled dataset. Our aim is to investigate whether cross-linguistically common generalizations may be easier to learn in a laboratory setting than cross-linguistically rare generalizations. The morphological pattern under investigation is the so-called “syllable copy” reduplication found in Hiaki (also known as Yaqui, a Uto-Aztecan language of Sonora, Mexico and Arizona, USA). This pattern shows variable copying of a CV or CVC syllable, depending on the syllable structure of the base. Specifically, coda consonants can copy in reduplication if and only if there is a corresponding coda in the base.
+
+Using a controlled artificial language experiment with a forced-choice paradigm, we show that native English speakers with no prior exposure to a language with a grammar employing reduplication are in many cases able to learn such a variable CV or CVC syllable-copying rule as measured by eventual above-chance selection of the correct form. However, compared to participants learning either a consistent CV or CVC copying rule, the performance of participants tasked with learning such a variable syllable-copying rule improves more slowly, and these participants make more errors overall. We suggest that such a difference in learnability may be one of a number of factors helping to explain the typological rarity of certain morphological patterns.
+
+The methods used here stem from work done in other artificial grammar learning studies, which have usually focused on phonology or syntax. For studies focusing on phonology, see Aslin, Saffran, and Newport (1998), Peperkamp (2003), Wilson (2006), Kapatsinsky (2013), and LaCross (2015), among others; for syntax, see Culbertson, Smolensky, and Legendre (2012) and Culbertson, Smolensky, and Wilson (2013). An important difference between these earlier studies and the current one is our focus on morphology. The phenomenon of interest in this paper concerns patterns of partial morphological reduplication. In particular, we examine the relative learnability of a cross-linguistically uncommon pattern of base-dependent reduplication involving the copying of a syllable.
+
+
+## Results
+
+### Participants
+
+One participant who was assigned to the CVC condition had zero correct responses and was excluded from the analysis. The remaining 108 participants consisted of 36 in each of the three morphological conditions (CV, CVC, CVX).
+
+### Accuracy by Condition and Prompt
+
+Each participant responded to 75 trials with the total reduplication ("Plural") prompt, and 75 trials with the partial reduplication ("Big") prompt, interleaved in a different random order for each participant. The proportion of correct responses in each 25 trial segment, separated by Condition and Prompt type and averaged over participants, is shown in Fig. XX. Individual participants' accuracy rates by trial bin are plotted as light circles, with random horizontal perturbations added to facilitate visibility. Note that because each participant responded to both prompts, each of these individual accuracy rates was obtained from only half of the trials in each 25 trial bin, on average. Confidence intervals for the mean percent correct are shown for each trial bin, and are calculated based on a Binomial distribution as if the collection of responses each bin were independent trials. This is unrealistic, however, due to heterogeneity across participants, items, and trials. To better model the dependencies and heterogeneities across observations, a generalized linear mixed model was fit to the data. This model is described in the following section.
+
+```{r accuracy_by_block_plot, fig.width = 9, fig.height = 4}
+correct_by_block_plot + theme_minimal()
+```
+
+### Statistical Analysis
+
+Accuracy was modeled for individual trials using a generalized linear mixed model with a logistic link and binomial likelihood. Condition (3 levels: CV, CVC, CVX) and Prompt (2 levels: Plural, Big) were included as categorical predictors, and Trial (1-150) was included as a quantitative predictor. All interactions were included as well. Random effects by Participant were included for Prompt, Trial and their interaction, and crossed random effects by Item were included for Condition[^1]. Maximum likelihood parameter estimates were obtained using the BOBYQA algorithm, as implemented by the `glmer()` function in the `lme4` R package.
+
+To aid in numerical stability and interpretability of the lower order coefficients, the predictors were recoded as follows: `Trial` was centered and scaled so that zero represented the mid-way point in the sequence. `Condition` was coded using planned Helmert contrasts, based on the theoretical predictions of the study: the first coefficient represented the difference in log odds of a correct respones between the `CVC` and `CV` conditions, and the second coefficient represented the difference between the `CVX` condition and the other two combined. These two contrasts were centered so that zero represented the average result. `Prompt` was reference coded, with partial reduplication (the "Big" rule) as the reference category. These choices should not affect the estimated probabilities; however, we found that coding the predictors in this way helped improve the numerical stability of the matrix operations involved in the iterative estimation algorithm.
+
+
+<!-- Point and interval estimates for the marginal probabilities of a correct response (averaged over trials) were obtained from the mixed model using the `emmeans` function from the R package of the same name. These are shown in Fig. XX, with corresponding 95% confidence intervals depicted by error bars. -->
+
+<!-- ```{r} -->
+<!-- group_means_plot + theme_bw() -->
+<!-- ``` -->
+
+#### Fitted Learning Curves
+
+To obtain 95% confidence bands for the predicted probability of a correct response at each combination of trial, condition, and prompt, a parametric bootstrap procedure was employed, using the `bootMer` algorithm in the `lme4` R package. Both fixed and random effects were resampled as part of the bootstrap algorithm, and fitted response curves by trial, condition and prompt, based on the fixed effects components only, were computed for each bootstrap sample. A total of 3200 bootstrap samples were used to calculate 95% confidence bands for the predicted accuracies by trial, which are shown in Fig. XX. Individual participants' fitted learning curves (adjusted for pseudoword) are overlaid for reference.
+
+```{r display_prediction_plot, cache = FALSE, fig.width = 9, fig.height = 4}
+prediction_plot + theme_minimal()
+```
+
+Participants improved their accuracy over the course of the experiment in all three groups for both the full and partial reduplication rules. As predicted, for trials using the total reduplication (`Plural`) rule, all three groups achieved near-ceiling performance by the end of the trial sequence[^2]. For trials using the partial reduplication (`Big`) rule, the CV and CVC groups still achieved near-ceiling performance by the end of the experiment, but the CVX group made significantly slower progress: the upper endpoint of the confidence interval for the success probability at the last trial is barely above 0.90 for this group.
+
+#### Hypothesis Tests
+
+The central prediction was that the CVX reduplication pattern would be more difficult to learn than either the CV or CVC pattern in the context of the `Big` rule, but not in the context of the `Plural` rule, whereas the CV and CVC reduplication patterns would be equally learnable for both types of rule.
+
+To assess whether the pattern of results across conditions differed according to the `Prompt` type (`Big` vs `Plural`), a reduced model was fit in which the three way interaction and the two way interaction between `Prompt` and `Condition` were omitted from the fixed effects structure. The other two-way interactions were retained and the random effects structure was the same[^3]. In context, this reduced model allowed both the level and rates of increase over trials in the odds of a correct response to differ between trial types, and to differ between conditions as well, but the differences among conditions in learning rate and level were required to be the same for both trial types.
+
+```{r lrt_prompt_condition_table}
+lrt_results <- with(glmer_results, anova(no_condition_by_prompt, full_model))
+lrt_results_table <- lrt_results %>% 
+  as_tibble() %>%
+  mutate(model = lrt_results %>% attr("row.names")) %>%
+  filter(model == "full_model") %>%  
+  rename(
+    chisq = Chisq,
+    df    = Df,
+    p     = `Pr(>Chisq)`) %>%
+  mutate(across(chisq, round, 2)) %>%
+  mutate(across(p, round, 3)) %>%
+  select(chisq, df, p)
+```
+
+
+A likelihood ratio test comparing the full model with this reduced model revealed significant evidence of an interaction between `Prompt` and `Condition` ($\chi^2(`r lrt_results_table[,"df"]`) = `r lrt_results_table[,"chisq"]`$, $p = `r lrt_results_table[,"p"]`$). As such, all subsequent testing and estimation of the effect of Condition was done separately for each `Prompt` type (the original model was employed for these analyses, but tests and confidence intervals involved simple effects).
+
+```{r anova_interaction_summaries}
+interaction_intervals <- full_model %>% 
+  emmeans(
+    specs = ~Condition*Prompt | csTrial, 
+    var   = "csTrial", 
+    at    = list(csTrial = seq(-3.02, 2.98, 1.2)), 
+    type = "response") %>% 
+  contrast(
+    interaction = list(Condition = "helmert", Prompt = "trt.vs.ctrl")) %>%
+  confint()
+
+interaction_contrasts <- full_model %>% 
+  emmeans(
+    specs = ~Condition*Prompt | csTrial, 
+    var   = "csTrial", 
+    at    = list(csTrial = seq(-3.02, 2.98, 1.2)), 
+    type = "response") %>% 
+  contrast(
+    interaction = list(Condition = "helmert", Prompt = "trt.vs.ctrl")) 
+
+interaction_results <- interaction_contrasts %>%
+  as_tibble() %>%
+  left_join(
+    interaction_intervals %>% 
+      as_tibble() %>%
+      select(Condition_helmert, Prompt_trt.vs.ctrl, csTrial, asymp.LCL, asymp.UCL), 
+    by = c("Condition_helmert", "Prompt_trt.vs.ctrl", "csTrial")) %>%
+  as_tibble() %>%
+  mutate(across(c(odds.ratio, SE, z.ratio, asymp.LCL, asymp.UCL), round, 2)) %>%
+  mutate(Trial = (as.numeric(as.character(csTrial)) + 3.02) / 0.04) %>%
+  rename(
+    Condition = Condition_helmert,
+    Prompt = Prompt_trt.vs.ctrl,
+    OR = odds.ratio,
+    z  = z.ratio,
+    p  = p.value,
+    ci_lwr = asymp.LCL,
+    ci_upr = asymp.UCL) %>%
+  select(Condition, Prompt, Trial, OR, ci_lwr, ci_upr, z, p)  
+
+interaction_initial_summary <- 
+  interaction_results %>%
+  filter(Trial == 0) %>%
+  group_by(Condition) %>%
+  summarize(
+    min_stat = min(abs(z)),
+    max_stat = max(abs(z)),
+    min_p    = min(p),
+    max_p    = max(p)) %>%
+  mutate(across(c(min_p, max_p), round, 3)) %>%  
+  column_to_rownames("Condition")
+
+interaction_summary <- 
+  interaction_results %>%
+  filter(Trial > 0) %>%
+  group_by(Condition) %>%
+  summarize(
+    min_stat = min(abs(z)),
+    max_stat = max(abs(z)),
+    min_p    = min(p),
+    max_p    = max(p)) %>%
+  mutate(across(c(min_p, max_p), round, 3)) %>%
+  mutate(Condition = case_when(
+    Condition == "CVC vs earlier" ~ "CVC vs CV",
+    Condition == "CVX vs earlier" ~ "CVX vs rest"
+  )) %>%
+  column_to_rownames(var = "Condition")
+```
+
+```{r interaction_contrast_table}
+interaction_contrast_table <- interaction_results %>%
+  arrange(Condition, Trial) %>%
+  mutate(across(p, round, 3)) %>%
+  mutate(
+    `95% CI` = paste0("(", ci_lwr, " , ", ci_upr, ")")) %>%
+  mutate(
+    `Condition Contrast` = case_when(
+      Condition == "CVC vs earlier" ~ "CVC vs CV",
+      Condition == "CVX vs earlier" ~ "CVX vs rest")) %>%
+  mutate(
+    `Prompt Contrast` = case_when(
+      `Condition Contrast` == "CVC vs CV" & Trial == 0 ~ as.character(Prompt),
+      TRUE ~ ""),
+    `Condition Contrast` = case_when(
+      Trial == 0 ~ as.character(`Condition Contrast`),
+      TRUE ~ ""),
+    `P-value` = case_when(
+      p < 0.001 ~ "< 0.001",
+      TRUE      ~ format(p, digits = 3, nsmall = 3)),
+    ` ` = case_when(
+      p < 0.001 ~ "***",
+      p < 0.01  ~ "**",
+      p < 0.05  ~ "*",
+      TRUE      ~ "")) %>%
+  select(`Prompt Contrast`, `Condition Contrast`, Trial, OR, "95% CI", z, `P-value`, ` `)
+```
+
+
+```{r condition_tests, cache = FALSE}
+condition_tests <- full_model %>%
+  emmeans(
+    specs = helmert ~ Condition | Prompt * csTrial, 
+    var   = "csTrial", 
+    at    = list(csTrial = seq(-3.02, 2.98, 1.2)),
+    type  = "response") %>%
+  test(joint = TRUE) %>%
+  pluck("contrasts") %>%
+  as_tibble() %>%
+  mutate(Chisq  = F.ratio * df1) %>%
+  rename(
+    Fstat = F.ratio,
+    pvalue = p.value) %>%
+  mutate(
+    Chisq = round(Chisq, 2),
+    Fstat = round(Fstat, 2),
+    pvalue = round(pvalue, 3))
+```
+
+```{r condition_intervals, cache = FALSE}
+condition_intervals <- full_model %>%
+  emmeans(
+    specs = ~ Condition | Prompt * csTrial, 
+    var   = "csTrial", 
+    at    = list(csTrial = seq(-3.02, 2.98, 1.2))) %>%
+  as_tibble() %>%
+  mutate(across(c(emmean, asymp.LCL, asymp.UCL), logistic))
+```
+
+```{r p_value_tables, cache = FALSE}
+initial_P <- condition_tests %>%
+  filter(csTrial == -3.02) %>%
+  mutate(across(c(Chisq, pvalue), round, digits = 2)) %>%
+  column_to_rownames(var = "Prompt")
+
+P_summary <- condition_tests %>%
+  filter(csTrial > -3) %>%
+  group_by(Prompt) %>%
+  summarize(
+    df      = first(df1),
+    min_chi = min(Chisq),
+    max_chi = max(Chisq),
+    min_P   = min(pvalue),
+    max_P   = max(pvalue)
+  ) %>%
+  mutate(across(c(min_chi, max_chi), round, digits = 2)) %>%
+  mutate(across(c(min_P, max_P), round, digits = 3)) %>%
+  column_to_rownames(var = "Prompt")
+```
+
+```{r contrast_tests, cache = FALSE}
+contrast_tests <- full_model %>%
+  emmeans(
+    specs = helmert ~ Condition | Prompt * csTrial, 
+    var   = "csTrial", 
+    at    = list(csTrial = seq(-3.02, 2.98, 1.2)),
+    type  = "response") %>%
+  pluck("contrasts") %>%
+  as_tibble()
+
+contrast_intervals <- full_model %>%
+  emmeans(
+    specs = helmert ~ Condition | Prompt * csTrial, 
+    var   = "csTrial", 
+    at    = list(csTrial = seq(-3.02, 2.98, 1.2)),
+    type  = "response") %>%
+  pluck("contrasts") %>%
+  confint() %>%
+  as_tibble()
+```
+
+```{r contrast_display_results, cache = FALSE}
+contrast_results <- contrast_tests %>%
+  left_join(
+    contrast_intervals %>% select(contrast, Prompt, csTrial, asymp.LCL, asymp.UCL),
+    by = c("contrast", "Prompt", "csTrial")) %>%
+  mutate(across(c(odds.ratio, SE, z.ratio, asymp.LCL, asymp.UCL), round, 2)) %>%
+  mutate(Trial = (as.numeric(as.character(csTrial)) + 3.02) / 0.04) %>%
+  rename(
+    OR = odds.ratio,
+    z  = z.ratio,
+    p  = p.value,
+    ci_lwr = asymp.LCL,
+    ci_upr = asymp.UCL) %>%
+  select(Prompt, Trial, contrast, OR, ci_lwr, ci_upr, z, p)
+
+contrast_initial_summary <- 
+  contrast_results %>%
+  filter(Trial == 0) %>%
+  group_by(Prompt, contrast) %>%  
+  summarize(
+    min_stat = min(abs(z)),
+    max_stat = max(abs(z)),
+    min_p    = min(p),
+    max_p    = max(p))
+
+contrast_summary <- 
+  contrast_results %>%
+  filter(Trial > 0) %>%
+  group_by(Prompt, contrast) %>%
+  summarize(
+    min_stat = min(abs(z)),
+    max_stat = max(abs(z)),
+    min_p    = min(p),
+    max_p    = max(p)) %>%
+  mutate(across(c(min_p, max_p), round, 3)) %>%
+  filter(Prompt == "Big") %>%
+  mutate(contrast = case_when(
+    contrast == "CVC vs earlier" ~ "CVC vs CV",
+    contrast == "CVX vs earlier" ~ "CVX vs rest"
+  )) %>%
+  column_to_rownames(var = "contrast")
+```
+
+```{r contrast_table, cache = FALSE}
+contrast_table <- contrast_results %>%
+  arrange(Prompt, contrast, Trial) %>%
+  mutate(across(p, round, 3)) %>%
+  mutate(
+    `95% CI` = paste0("(", ci_lwr, " , ", ci_upr, ")")) %>%
+  rename(Contrast = contrast) %>%
+  mutate(
+    Contrast = case_when(
+      Contrast == "CVC vs earlier" ~ "CVC vs CV",
+      Contrast == "CVX vs earlier" ~ "CVX vs rest")) %>%
+  mutate(
+    Prompt = case_when(
+      Prompt == "Big" & Contrast == "CVC vs CV" & Trial == 0 ~ "Big",
+      Prompt == "Plural" & Contrast == "CVC vs CV" & Trial == 0 ~ "Plural",
+      TRUE ~ ""),
+    Contrast = case_when(
+      Trial == 0 ~ Contrast,
+      TRUE ~ ""),
+    `P-value` = case_when(
+      p < 0.001 ~ "< 0.001",
+      TRUE      ~ format(p, digits = 3, nsmall = 3)),
+    ` ` = case_when(
+      p < 0.001 ~ "***",
+      p < 0.01  ~ "**",
+      p < 0.05  ~ "*",
+      TRUE      ~ "")) %>%
+    # `P-value` = paste(p, sig)) %>%
+  select(Prompt, Contrast, Trial, OR, "95% CI", z, `P-value`, ` `)
+```
+
+Simple effects of `Condition` were obtained from the model for each `Prompt` type at 30-trial intervals (0, 30, 60, 90, 120, 150). Using Wald tests with an asymptotic $\chi^2$ approximation of the sampling distribution of the standardized squared norm of the vector of fixed effects for `Condition` at each combination of `Prompt` and `Trial`, there is no significant evidence of a difference across conditions for either `Big` or the `Plural` trials at the beginning of the experiment (`Plural`: $\chi^2(2) = `r initial_P["Plural","Chisq"]`$, $p = `r initial_P["Plural","pvalue"]`$; `Big`: $\chi^2(2) = `r initial_P["Big","Chisq"]`$, $p = `r initial_P["Big","pvalue"]`$). For the trials with the `Plural` reduplication prompt, there is no significant evidence of any differences across conditions at any later trial either (all $\chi^2(2) \leq `r P_summary["Plural", "max_chi"]`$; all $p \geq `r P_summary["Plural", "min_P"]`$). For the trials with the `Big` reduplication prompt, there is significant evidence of a difference across conditions at each trial marker from 30 on (all $\chi^2(2) \geq `r P_summary["Big", "min_chi"]`$; All $p \leq `r P_summary["Big", "max_P"]`$)
+
+Planned Helmert contrasts for the `Condition` factor were tested for the `Big` prompt trials, every 30 trials starting at trial 30.  The first compared accuracy in the CV condition to the CVC condition, and the second compared accuracy in the CVX condition to the other two combined. Asymptotic Wald tests reveal significant evidence of lower accuracy in the CVX condition than in the other two at all five reference trials (all $z > `r contrast_summary["CVX vs rest","min_stat"]`$; all $p < `r contrast_summary["CVX vs rest", "max_p"]`$). There is no significant evidence of a difference in accuracy between the CV and CVC conditions at any trial (all $z < `r contrast_summary["CVC vs CV","max_stat"]`$; all $p > `r contrast_summary["CVC vs CV", "min_p"]`$). Odds ratios and confidence intervals for each contrast at each reference trial are given in Table XX.
+
+```{r show_contrast_table, results = 'markdown'}
+knitr::kable(
+  contrast_table, 
+  format = "html",
+  format.args = list(na.encode = FALSE, width = 6)) %>%
+  kableExtra::kable_styling(full_width = TRUE) %>%
+  kableExtra::save_kable(file = "tables/contrast_table.pdf")
+```
+
+Contrasts for the interaction between `Prompt` and `Condition` were tested by comparing the coefficients for each of the `Condition` contrasts for the `Plural` prompt with their counterparts in the `Big` prompt  at each of the reference trials. No evidence of a difference of differences was found at Trial 0 for either the CVC vs CV contrast (all $z < `r interaction_initial_summary["CVC vs earlier","max_stat"]`$; all $p > `r interaction_initial_summary["CVC vs earlier", "min_p"]`$) or the CVX vs others contrast (all $z < `r interaction_initial_summary["CVX vs earlier","max_stat"]`$; all $p > `r interaction_initial_summary["CVX vs earlier", "min_p"]`$). For the CVC vs CV contrast, no evidence of a difference of differences was found at any subsequent reference trial either (all $z < `r interaction_summary["CVC vs CV","max_stat"]`$; all $p > `r interaction_summary["CVC vs CV", "min_p"]`$); however for the CVX vs others contrast, the odds ratios were significantly different between the two Prompt types (all $z > `r interaction_summary["CVX vs rest","min_stat"]`$; all $p < `r interaction_summary["CVX vs rest", "max_p"]`$). Odds ratios and confidence intervals for these interaction coefficients at each reference trial are given in Table XX.
+
+```{r show_interaction_contrast_table, results = 'markdown'}
+knitr::kable(
+  interaction_contrast_table, 
+  format = "html",
+  format.args = list(na.encode = FALSE, width = 4)) %>%
+  kableExtra::kable_styling(full_width = TRUE) %>%
+  kableExtra::save_kable(file = "tables/interaction_contrast_table.pdf")
+```
+
+## Appendices
+
+### Model Coefficients and Confidence Intervals
+
+![](tables/contrast_table.pdf)
+
+![](tables/interaction_contrast_table.pdf)
+
+### Individual Modeled Learning Curves
+
+```{r subject_curves, fig.width=12, fig.height=15}
+subject_plot
+```
+
+[^1]: In the syntax used by the `lme4` package, the model formula is `Accuracy ~ Condition * Trial * Prompt + (Condition | Item) + (Trial * Prompt | Participant)`
+[^2]: The discrepancy between the empirical mean accuracy curves in Fig. XX and the predicted probabilities of a correct response from the mixed model shown in Fig. XX -- particularly the fact that the empirical means are so much lower than the modeled probabilities -- bears explanation. The random effects structure allows for individual participants and individual items to have higher or lower predicted accuracy than the aggregate prediction. On average, these perturbations from the aggregate prediction are zero; however, this is only true in the log odds space. A given perturbation in the log odds corresponds to a larger difference in probabilities when the aggregate probability is near 0.5; hence a symmetric distribution of perturbations of the log-odds corresponds to a skewed distribution in probability space, such that the fitted probability is closer to 0 or 1 than the empirical average of the perturbed probabilities.
+[^3]: In `lme4` syntax, the model formula is `Accuracy ~ Trial * (Condition + Prompt) + (Condition | Item) + (Trial * Prompt | Participant)`
